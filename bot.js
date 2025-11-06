@@ -98,7 +98,7 @@ function isAdmin(id) {
     return ADMIN_CHAT_ID && Number(id) === ADMIN_CHAT_ID;
 }
 
-// --- 💡 Reply Logic: Centralized function for replying to a ticket (Used by Reply State, /reply, /qr) ---
+// --- 💡 Reply Logic: Centralized function for replying to a ticket ---
 async function sendAdminReply(ctx, ticketId, replyText) {
     const tIdx = TICKETS.findIndex(x=>x.id===ticketId);
     if(tIdx === -1) return ctx.reply('التذكرة غير موجودة.');
@@ -149,7 +149,7 @@ const TEXTS = {
   ADMIN_KB: (ticketId) => Markup.inlineKeyboard([
     [
       Markup.button.callback('✅ إغلاق التذكرة', `ticket_close:${ticketId}`),
-      Markup.button.callback('↩️ الرد على التذكرة', `ticket_reply:${ticketId}`) // هذا الزر يفعّل الـ ADMIN_STATE
+      Markup.button.callback('↩️ الرد على التذكرة', `ticket_reply:${ticketId}`) 
     ],
     [
       Markup.button.callback('⚙️ عرض التفاصيل', `ticket_view:${ticketId}`),
@@ -241,21 +241,18 @@ BOT.on('text', async (ctx) => {
         const adminId = ctx.from.id;
 
         // [ FIX: 1 - ADMIN REPLY STATE ] 
-        // إذا كان الأدمن في حالة انتظار رد، استخدم النص الحالي كـ رد على التذكرة.
         if (isAdmin(adminId) && ADMIN_STATE[adminId]) {
             const ticketId = ADMIN_STATE[adminId];
-            delete ADMIN_STATE[adminId]; // إزالة حالة الانتظار
+            delete ADMIN_STATE[adminId]; 
             
-            // تنفيذ وظيفة الرد المركزية
             await sendAdminReply(ctx, ticketId, text);
             return;
         }
 
         // [ FIX: 2 - ADMIN GUARDRAIL ] 
-        // تجاهل أي رسالة نصية عادية من الأدمن لا تبدأ بأمر (/)
         if (isAdmin(adminId)) {
-             if (text.startsWith('/')) return; // السماح للأوامر الإدارية بالمرور
-             return; // تجاهل أي نص عادي من الأدمن لمنع إنشاء تذاكر جديدة
+             if (text.startsWith('/')) return;
+             return; 
         }
 
 
@@ -276,17 +273,20 @@ BOT.on('text', async (ctx) => {
         
         // --- Key/Wallet Automatic Check and Ticket ---
         const maybeKey = text.toUpperCase();
+        
+        // 1. Check for known key (FIXED: Calls createTicket)
         if (isKnownKey(maybeKey)) {
             await ctx.replyWithMarkdown(TEXTS.KEY_VALID(maybeKey));
             return createTicket(ctx, 'key-check', `Key check: ${maybeKey}`);
         }
         
+        // 2. Check for TRC20 Wallet (FIXED: Calls createTicket)
         if (looksLikeTRC20(text) && !maybeKey.includes('TXID')) {
             await ctx.replyWithMarkdown(TEXTS.WALLET_VALID(text));
             return createTicket(ctx, 'wallet-check', `Wallet check: ${text}`);
         }
 
-        // --- Otherwise treat as generic support message -> create ticket ---
+        // 3. Otherwise treat as generic support message -> create ticket (This also works for TXID, etc.)
         return createTicket(ctx, 'support', text);
 
     } catch (e) {
@@ -312,6 +312,7 @@ BOT.on(['photo', 'document'], async (ctx) => {
             caption: caption
         };
 
+        // Media always creates a ticket
         return createTicket(ctx, `support-media-${type}`, caption, mediaInfo);
         
     } catch (e) {
@@ -329,7 +330,7 @@ BOT.on('callback_query', async (ctx) => {
         const action = parts[0];
         const ticketId = parts[1];
         
-        await ctx.answerCbQuery(); // Dismiss loading icon
+        await ctx.answerCbQuery(); 
 
         // --- FAQ Navigation ---
         if (action.startsWith('faq_')) {
@@ -359,10 +360,9 @@ BOT.on('callback_query', async (ctx) => {
                 return;
             }
             
-            // [ FIX: 3 - REPLY STATE TRIGGER ] 
-            // عند ضغط الأدمن على زر الرد، يتم تعيين حالة انتظار الرد
+            // REPLY STATE TRIGGER
             if (action === 'ticket_reply') {
-                ADMIN_STATE[ctx.from.id] = ticketId; // Set the ticket ID we are waiting for a reply on
+                ADMIN_STATE[ctx.from.id] = ticketId; 
                 return ctx.reply(`↩️ *وضع الرد على التذكرة ${ticketId}*:\nمن فضلك أرسل نص ردك الآن مباشرة.`, { parse_mode: 'Markdown' });
             }
             
@@ -383,7 +383,6 @@ BOT.on('callback_query', async (ctx) => {
         
         // --- Client Confirmation Actions ---
         if (action.startsWith('confirm_close_')) {
-            // ... (Client confirmation logic remains the same)
             const ticketIndex = TICKETS.findIndex(t => t.id === ticketId);
             if (ticketIndex === -1) return ctx.reply('عفواً، التذكرة غير موجودة/محذوفة.');
 
@@ -410,7 +409,7 @@ BOT.on('callback_query', async (ctx) => {
     }
 });
 
-// --- 4. Admin Command Handlers ---
+// --- 4. Admin/Client Command Handlers ---
 
 // /tickets - admin only: list open tickets
 BOT.command('tickets', async (ctx) => {
@@ -458,7 +457,6 @@ BOT.command('reply', async (ctx) => {
     const id = parts[1].trim().toUpperCase();
     const replyText = parts.slice(2).join(' ');
     
-    // استخدام الدالة المركزية
     await sendAdminReply(ctx, id, replyText);
 });
 
@@ -477,7 +475,6 @@ BOT.command('qr', async (ctx) => {
     
     const replyText = CONFIG.QUICK_REPLIES[qrKey];
     
-    // استخدام الدالة المركزية
     await sendAdminReply(ctx, id, replyText);
 });
 
