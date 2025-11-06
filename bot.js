@@ -1,10 +1,8 @@
-// bot.js (modified to use HTML + webhook + safe escaping)
-// Based on original uploaded by user. Preserves original logic, only fixes parsing and webhook flow.
-
+// Telegram Support Bot (Formal technical tone)
+// Requirements: node >=16, npm
 const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
-const express = require('express');
 
 // --- Configuration Loading ---
 const cfgPath = path.resolve(__dirname, 'config.json');
@@ -12,13 +10,14 @@ if (!fs.existsSync(cfgPath)) {
   console.error('Missing config.json. Please ensure it exists and is configured.');
   process.exit(1);
 }
-const CONFIG = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+const CONFIG = JSON.parse(fs.readFileSync(cfgPath));
 if (!CONFIG.BOT_TOKEN || CONFIG.BOT_TOKEN === 'YOUR_BOT_TOKEN') {
   console.error('Please set BOT_TOKEN in config.json');
   process.exit(1);
 }
 const BOT = new Telegraf(CONFIG.BOT_TOKEN);
-const ADMIN_CHAT_ID = Number(CONFIG.ADMIN_CHAT_ID || 0);
+// ADMIN_CHAT_ID changed to ADMIN_CHAT_IDS array for multiple admins
+const ADMIN_CHAT_IDS = (Array.isArray(CONFIG.ADMIN_CHAT_IDS) ? CONFIG.ADMIN_CHAT_IDS : [CONFIG.ADMIN_CHAT_IDS]).map(id => Number(id));
 
 // --- Simple File-based DB Setup ---
 const DB_DIR = path.resolve(__dirname, 'data');
@@ -43,13 +42,8 @@ let TICKETS = loadJSON(TICKETS_FILE, []);
 let LOGS = loadJSON(LOG_FILE, []);
 
 // --- Data & Helpers ---
-const PURCHASE_KEYS = [
-  "FP12-L1-15K-W01","FP12-L2-100K-W03","FP12-L3-250K-W05","FP12-L4-400K-W06",
-  "FP12-L5-500K-W09","FP12-TEST-100-W15","FP12-R-200K-W17","FP12-INS-750K-W21",
-  "FP12-L6-900K-W22","FP12-L7-1.2M-W23","FP12-DEV-5K-W24","FP12-REC-350K-W25",
-  "FP12-SUB-M1-W11","FP12-SUB-M2-W12","FP12-SUB-Q1-W13","FP12-SUB-Y1-W14",
-  "FP12-L4-1M-W07","FP12-FD-2M-W26","FP12-FD-5M-W19","FP12-FD-10M-W20"
-];
+// PURCHASE_KEYS moved to config.json for flexibility
+const PURCHASE_KEYS = CONFIG.PURCHASE_KEYS || [];
 
 function botLog(entry) {
   try {
@@ -82,7 +76,7 @@ function determinePriority(text) {
 }
 
 function getUserInfo(ctx) {
-    const from = ctx.from || {};
+    const from = ctx.from;
     return {
         id: from.id,
         username: from.username ? `@${from.username}` : '',
@@ -90,18 +84,12 @@ function getUserInfo(ctx) {
     };
 }
 
-// --- Safe HTML escaping to avoid Telegram entity parsing errors ---
-function esc(text) {
-  if (text === undefined || text === null) return '';
-  const s = String(text);
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+// Check if user is an Admin (now supports multiple IDs)
+function isAdmin(id) {
+    return ADMIN_CHAT_IDS.includes(Number(id));
 }
 
-// --- UI Texts & Keyboards (use functions so we can esc content when needed) ---
+// --- UI Texts & Keyboards ---
 const TEXTS = {
   START: `📡 Flash Protocol Support Hub\n\nأهلاً بك.\nتستطيع إرسال:\n• كود المفتاح (Key)\n• أو عنوان المحفظة (TRC20)\n• أو وصف للمشكلة الآن.\n\nاختر:`,
 
@@ -110,32 +98,35 @@ const TEXTS = {
     ['📝 بلّغ عن مشكلة', '📕 الأسئلة الشائعة']
   ]).resize(),
 
-  ACK_RECEIVED: (ticketId, priority) => `✅ تم استلام طلبك. رقم التذكرة: <b>${esc(ticketId)}</b>\nالأولوية: <b>${esc(priority)}</b>\n\nحالة التذكرة: <i>قيد المراجعة</i>.\nيمكنك متابعة حالتها عبر الأمر: <code>/status ${esc(ticketId)}</code>`,
+  ACK_RECEIVED: (ticketId, priority) => `✅ تم استلام طلبك. رقم التذكرة: *${ticketId}*\nالأولوية: *${priority}*\n\nحالة التذكرة: _قيد المراجعة_.\nيمكنك متابعة حالتها عبر الأمر: \`/status ${ticketId}\`\n\n*ملاحظة: يمكنك الرد على هذه الرسالة لإضافة تفاصيل جديدة إلى نفس التذكرة قبل أن يتم الرد عليها من الإدارة.*`,
 
-  KEY_VALID: (key) => `🔒 فحص المفتاح: <b>${esc(key)}</b>\n\n✅ النتيجة: المفتاح معروف وصالح حسب قاعدة البيانات المحلية.`,
-  KEY_UNKNOWN: (key) => `🔒 فحص المفتاح: <b>${esc(key)}</b>\n\n⚠️ النتيجة: لم يتم العثور على هذا الكود في النظام المحلي. سيتم حفظ التذكرة لمراجعة الفريق.`,
-  WALLET_VALID: (addr) => `🔗 فحص المحفظة: <code>${esc(addr)}</code>\n\n✅ النتيجة: عنوان TRC20 يبدو صحيحاً وصالحاً لربط العرض المبدئي.`,
-  WALLET_INVALID: (addr) => `🔗 فحص المحفظة: <code>${esc(addr)}</code>\n\n⚠️ النتيجة: تنسيق العنوان غير صحيح. تأكد أن العنوان يبدأ بحرف T وطوله صحيح.`,
+  KEY_VALID: (key) => `🔒 فحص المفتاح: *${key}*\n\n✅ النتيجة: المفتاح معروف وصالح حسب قاعدة البيانات المحلية.`,
+  KEY_UNKNOWN: (key) => `🔒 فحص المفتاح: *${key}*\n\n⚠️ النتيجة: لم يتم العثور على هذا الكود في النظام المحلي. سيتم حفظ التذكرة لمراجعة الفريق.`,
+  WALLET_VALID: (addr) => `🔗 فحص المحفظة: \`${addr}\`\n\n✅ النتيجة: عنوان TRC20 يبدو صحيحاً وصالحاً لربط العرض المبدئي.`,
+  WALLET_INVALID: (addr) => `🔗 فحص المحفظة: \`${addr}\`\n\n⚠️ النتيجة: تنسيق العنوان غير صحيح. تأكد أن العنوان يبدأ بحرف T وطوله صحيح.`,
   HELP: `⚙️ أوامر مفيدة:\n/start - بداية المحادثة\n/help - تعليمات\n/status <TICKET_ID> - عرض حالة تذكرتك\n`,
   SUPPORT_PROMPT: `📝 من فضلك اكتب وصف المشكلة هنا. اذكر أكبر قدر ممكن من التفاصيل (المفتاح إن وجد، محفظة، TXID، صور...).`,
-
-  ADMIN_NOTICE: (ticket) =>
-    `🔔 <b>تذكرة جديدة</b>: <b>${esc(ticket.id)}</b> (الأولوية: ${esc(ticket.priority)})\n` +
-    `من: <b>${esc(ticket.user_name)}</b> (${esc(ticket.user_id)}) ${esc(ticket.user_username)}\n` +
-    `نوع: <b>${esc(ticket.type)}</b>\n` +
-    `محتوى:\n<pre>${esc(ticket.content)}</pre>`,
-
-  ADMIN_KB: (ticketId) => Markup.inlineKeyboard([
-    [
-      Markup.button.callback('✅ إغلاق التذكرة', `ticket_close:${ticketId}`),
-      Markup.button.callback('↩️ الرد على التذكرة', `ticket_reply:${ticketId}`)
-    ],
-    [
-      Markup.button.callback('⚙️ عرض التفاصيل', `ticket_view:${ticketId}`),
-      Markup.button.callback('🗑️ حذف التذكرة (للتجريب)', `ticket_delete:${ticketId}`)
-    ]
-  ]),
-
+  
+  ADMIN_NOTICE: (ticket) => `🔔 تذكرة جديدة: *${ticket.id}* (الأولوية: ${ticket.priority})\nمن: ${ticket.user_name} (${ticket.user_id}) ${ticket.user_username}\nنوع: ${ticket.type}\nحالة: *${ticket.status.toUpperCase()}*\nمحتوى:\n${ticket.content}`,
+  
+  // Updated Admin Keyboard with QR buttons
+  ADMIN_KB: (ticketId) => {
+      const qrButtons = Object.keys(CONFIG.QUICK_REPLIES).map(key => 
+          Markup.button.callback(`[${key.toUpperCase()}]`, `qr_exec:${ticketId}:${key}`)
+      );
+      return Markup.inlineKeyboard([
+          [
+            Markup.button.callback('✅ إغلاق التذكرة', `ticket_close:${ticketId}`),
+            Markup.button.callback('↩️ الرد على التذكرة', `ticket_reply:${ticketId}`) // This will prompt the admin to use /reply
+          ],
+          qrButtons.slice(0, 3), // Add up to 3 QR buttons
+          [
+            Markup.button.callback('⚙️ عرض التفاصيل', `ticket_view:${ticketId}`),
+            Markup.button.callback('🗑️ حذف (تجريب)', `ticket_delete:${ticketId}`)
+          ]
+      ]);
+  },
+  
   CLIENT_CONFIRM_KB: (ticketId) => Markup.inlineKeyboard([
       Markup.button.callback('✅ نعم، تم حلها', `confirm_close_yes:${ticketId}`),
       Markup.button.callback('❌ لا، المشكلة مستمرة', `confirm_close_no:${ticketId}`)
@@ -143,9 +134,29 @@ const TEXTS = {
 };
 
 // --- Ticket Creation Helper ---
-async function createTicket(ctx, type, content, media = null) {
+async function createTicket(ctx, type, content, media = null, replyToTicketId = null) {
     const userInfo = getUserInfo(ctx);
     const priority = determinePriority(content);
+    
+    // Check if client is replying to an open ticket
+    if (replyToTicketId) {
+        const existingTicket = TICKETS.find(t => t.id === replyToTicketId && t.user_id === userInfo.id && t.status !== 'closed (Admin)');
+        if (existingTicket && existingTicket.status.includes('open')) {
+            // Append message to existing ticket content and notify admin
+            existingTicket.content += `\n\n--- إضافة العميل (${new Date().toLocaleTimeString()}):\n${content}`;
+            existingTicket.status = 'open (updated by client)';
+            saveJSON(TICKETS_FILE, TICKETS);
+            await ctx.reply(`✅ تم إضافة رسالتك إلى التذكرة *${existingTicket.id}*. سيتم إشعار فريق الدعم بالتحديث.`, TEXTS.OPTIONS_KB);
+            
+            // Notify admin with updated content
+            try {
+                 await BOT.telegram.sendMessage(ADMIN_CHAT_IDS[0], `⚠️ تحديث على التذكرة *${existingTicket.id}* (مفتوحة):\n\n${content}`, { parse_mode: 'Markdown' });
+            } catch(e) { console.error('Admin update send error:', e); }
+            return existingTicket;
+        }
+    }
+    
+    // Create new ticket
     const ticket = {
         id: genTicketId(),
         time: new Date().toISOString(),
@@ -157,121 +168,138 @@ async function createTicket(ctx, type, content, media = null) {
         priority: priority,
         media: media,
         status: 'open',
-        admin_notes: []
+        admin_notes: [],
+        history: [{time: new Date().toISOString(), action: 'created', by: 'client'}]
     };
-    TICKETS.unshift(ticket);
+    TICKETS.unshift(ticket); 
     saveJSON(TICKETS_FILE, TICKETS);
-
+    
     // Notify admin
-    if (ADMIN_CHAT_ID) {
+    if (ADMIN_CHAT_IDS.length > 0) {
         let adminMsg = TEXTS.ADMIN_NOTICE(ticket);
-        const adminKb = TEXTS.ADMIN_KB(ticket.id).reply_markup;
-
+        
+        // Send to the first admin (or all if needed, but first is enough for initial notice)
+        const targetAdminId = ADMIN_CHAT_IDS[0];
+        
         if (media) {
-            adminMsg += `\n\n_مرفق ملف/صورة: ${esc(media.file_type)} (${esc(media.file_name || media.file_id)})_`;
-
-            // Send media to admin (caption + inline keyboard)
+            adminMsg += `\n\n_مرفق ملف/صورة: ${media.file_type}_`;
+            
             try {
                 if (media.file_type === 'photo') {
-                    await BOT.telegram.sendPhoto(ADMIN_CHAT_ID, media.file_id, {
-                        caption: adminMsg,
-                        parse_mode: 'HTML',
-                        reply_markup: adminKb
+                    await BOT.telegram.sendPhoto(targetAdminId, media.file_id, { 
+                        caption: adminMsg, 
+                        parse_mode: 'Markdown',
+                        ...TEXTS.ADMIN_KB(ticket.id)
                     });
                 } else {
-                    await BOT.telegram.sendDocument(ADMIN_CHAT_ID, media.file_id, {
-                        caption: adminMsg,
-                        parse_mode: 'HTML',
-                        reply_markup: adminKb
+                    await BOT.telegram.sendDocument(targetAdminId, media.file_id, { 
+                        caption: adminMsg, 
+                        parse_mode: 'Markdown',
+                        ...TEXTS.ADMIN_KB(ticket.id)
                     });
                 }
             } catch(e) { console.error('Admin media send error:', e); }
+            
         } else {
-            // Send text ticket to admin
-            try {
-                await BOT.telegram.sendMessage(ADMIN_CHAT_ID, adminMsg, {
-                    parse_mode: 'HTML',
-                    reply_markup: adminKb
-                });
+             // Send text ticket to admin
+            try { 
+                await BOT.telegram.sendMessage(targetAdminId, adminMsg, { 
+                    parse_mode: 'Markdown', 
+                    ...TEXTS.ADMIN_KB(ticket.id) 
+                }); 
             } catch(e) { console.error('Admin text send error:', e); }
         }
     }
-
-    // Reply to client acknowledging (HTML safe)
-    try {
-      await ctx.reply(TEXTS.ACK_RECEIVED(ticket.id, priority), { parse_mode: 'HTML' });
-    } catch (e) {
-      // fallback plain text
-      await ctx.reply(`تم استلام تذكرتك: ${ticket.id}`);
-    }
-
+    
+    await ctx.replyWithMarkdown(TEXTS.ACK_RECEIVED(ticket.id, priority), TEXTS.OPTIONS_KB);
     botLog(`Ticket ${ticket.id} created by ${userInfo.id}. Type: ${type}`);
     return ticket;
 }
 
 
 // --- Handlers ---
+
 BOT.start(async (ctx) => {
   await ctx.reply(TEXTS.START, TEXTS.OPTIONS_KB);
-  botLog(`Start from ${ctx.from && ctx.from.id}`);
+  botLog(`Start from ${ctx.from.id}`);
 });
 
 BOT.help((ctx) => ctx.reply(TEXTS.HELP));
 
 // --- 1. Client Status Command (/status) ---
 BOT.command('status', async (ctx) => {
-    const parts = (ctx.message && ctx.message.text ? ctx.message.text.split(' ') : []).filter(Boolean);
+    const parts = ctx.message.text.split(' ').filter(Boolean);
     if (parts.length < 2) return ctx.reply('الاستخدام: /status <TICKET_ID>');
     const id = parts[1].trim().toUpperCase();
 
     const t = TICKETS.find(x => x.id === id && Number(x.user_id) === Number(ctx.from.id));
     if (!t) return ctx.reply('عذراً، لم يتم العثور على تذكرة بهذا الرقم أو أنها ليست تذكرتك.');
 
-    let msg = `<b>حالة التذكرة: ${esc(t.id)}</b>\n`;
-    msg += `الأولوية: ${esc(t.priority)}\n`;
-    msg += `الحالة: <b>${esc(String(t.status).toUpperCase())}</b>\n`;
-    msg += `تم إنشاؤها في: ${esc(t.time.substring(0, 10))}\n`;
-    msg += `المحتوى: <pre>${esc(t.content.substring(0, 100))}...</pre>\n\n`;
+    let msg = `*حالة التذكرة: ${t.id}*\n`;
+    msg += `الأولوية: ${t.priority}\n`;
+    msg += `الحالة: *${t.status.toUpperCase()}*\n`;
+    msg += `تم إنشاؤها في: ${t.time.substring(0, 10)}\n`;
+    msg += `المحتوى: _${t.content.substring(0, 100)}..._\n\n`;
 
-    if (t.status === 'closed' && t.admin_notes && t.admin_notes.length > 0) {
-        msg += `آخر رد من الإدارة:\n<pre>${esc(t.admin_notes[t.admin_notes.length - 1].reply.substring(0, 150))}...</pre>`;
+    // Display basic history/notes
+    if (t.history && t.history.length > 0) {
+        msg += `*سجل التفاعلات:*\n`;
+        t.history.slice(-3).forEach(h => {
+             msg += `• [${h.time.substring(5, 16)}] ${h.action} by ${h.by}\n`;
+        });
+        if (t.history.length > 3) msg += '...';
     } else if (t.status.includes('open') || t.status.includes('review') || t.status.includes('awaiting')) {
         msg += 'التذكرة قيد المراجعة، سيتم الرد عليك قريباً.';
     }
 
-    await ctx.reply(msg, { parse_mode: 'HTML' });
+    await ctx.replyWithMarkdown(msg);
 });
 
-// --- 2. Generic Text Handler (Ticket Creation / Quick Checks) ---
+// --- 2. Generic Text Handler (Ticket Creation / Quick Checks / Reply to open ticket) ---
 BOT.on('text', async (ctx) => {
     try {
         const text = (ctx.message.text || '').trim();
+        const replyToMessage = ctx.message.reply_to_message;
+        const userInfo = getUserInfo(ctx);
 
         // Check for quick keyboard commands
-        if (text === '🔑 إرسال كود مفتاح') return ctx.reply('أرسل كود المفتاح هنا (مثال: FP12-L3-250K-W05)');
-        if (text === '🏦 إرسال محفظة TRC20') return ctx.reply('أرسل عنوان المحفظة (TRC20) هنا (يبدأ بـ T)');
-        if (text === '📝 بلّغ عن مشكلة') return ctx.reply(TEXTS.SUPPORT_PROMPT);
-
+        if (['🔑 إرسال كود مفتاح', '🏦 إرسال محفظة TRC20', '📝 بلّغ عن مشكلة'].includes(text)) {
+            return ctx.reply(text === '📝 بلّغ عن مشكلة' ? TEXTS.SUPPORT_PROMPT : `أرسل ${text.split(' ')[1]} هنا.`);
+        }
+        
         // FAQ
         if (text === '📕 الأسئلة الشائعة') {
-             if(CONFIG.FAQ_DATA && CONFIG.FAQ_DATA.main && CONFIG.FAQ_DATA.main.buttons) {
-                 return ctx.reply(CONFIG.FAQ_DATA.main.text, Markup.inlineKeyboard(CONFIG.FAQ_DATA.main.buttons.map(b => [b])));
+             const faqData = CONFIG.FAQ_DATA && CONFIG.FAQ_DATA.main;
+             if(faqData && faqData.buttons) {
+                 return ctx.reply(faqData.text, Markup.inlineKeyboard(faqData.buttons.map(b => [b])));
              }
              return ctx.reply('عذراً، بيانات الأسئلة الشائعة غير متاحة حالياً.');
         }
-
+        
+        // --- Handle Client Reply to an open ticket ---
+        if (replyToMessage && replyToMessage.from.id === ctx.botInfo.id) {
+             const ackRegex = /رقم التذكرة:\s*\*([A-Z0-9-]+)\*/;
+             const match = replyToMessage.text.match(ackRegex);
+             if (match) {
+                 const ticketId = match[1];
+                 // Try to append message to existing ticket
+                 const updatedTicket = await createTicket(ctx, 'client_update', text, null, ticketId);
+                 if (updatedTicket) return; // Ticket updated, stop further processing
+             }
+        }
+        
         // --- Key/Wallet Automatic Check and Ticket ---
         const maybeKey = text.toUpperCase();
         if (isKnownKey(maybeKey)) {
-            await ctx.reply(TEXTS.KEY_VALID(maybeKey), { parse_mode: 'HTML' });
+            await ctx.replyWithMarkdown(TEXTS.KEY_VALID(maybeKey));
             return createTicket(ctx, 'key-check', `Key check: ${maybeKey}`);
         }
-
+        
         if (looksLikeTRC20(text)) {
-             if (maybeKey.includes('TXID')) {
+             if (maybeKey.includes('TXID')) { 
                  // Will fall through to support ticket below
              } else {
-                await ctx.reply(TEXTS.WALLET_VALID(text), { parse_mode: 'HTML' });
+                await ctx.replyWithMarkdown(TEXTS.WALLET_VALID(text));
                 return createTicket(ctx, 'wallet-check', `Wallet check: ${text}`);
              }
         }
@@ -300,7 +328,7 @@ BOT.on(['photo', 'document'], async (ctx) => {
         };
 
         return createTicket(ctx, `support-media-${type}`, caption, mediaInfo);
-
+        
     } catch (e) {
         console.error('on media error', e);
         ctx.reply('عفواً، حدث خطأ أثناء معالجة الملف المرفق. يرجى محاولة إرسال الرسالة النصية أولاً.');
@@ -311,12 +339,11 @@ BOT.on(['photo', 'document'], async (ctx) => {
 // --- 4. Callback Query Handler (For Inline Keyboards: FAQ, Admin Actions, Client Confirmation) ---
 BOT.on('callback_query', async (ctx) => {
     try {
-        const data = ctx.callbackQuery && ctx.callbackQuery.data;
-        if (!data) return;
+        const data = ctx.callbackQuery.data;
         const parts = data.split(':');
         const action = parts[0];
         const ticketId = parts[1];
-
+        
         await ctx.answerCbQuery(); // Dismiss loading icon
 
         // --- FAQ Navigation ---
@@ -337,35 +364,59 @@ BOT.on('callback_query', async (ctx) => {
             const ticket = TICKETS[ticketIndex];
 
             if (action === 'ticket_view') {
-                let msg = `<b>${esc(ticket.id)}</b> | ${esc(ticket.type)} | الأولوية: ${esc(ticket.priority)}\n`;
-                msg += `من: ${esc(ticket.user_name)} (${esc(ticket.user_id)}) ${esc(ticket.user_username)}\n`;
-                msg += `الحالة: <b>${esc(String(ticket.status).toUpperCase())}</b>\n\n`;
-                msg += `المحتوى:\n<pre>${esc(ticket.content)}</pre>`;
-                if (ticket.media) msg += `\n\n_مرفق: ${esc(ticket.media.file_type)} (ID: ${esc(String(ticket.media.file_id).substring(0,15))}...)_`;
-
-                await ctx.reply(msg, { parse_mode: 'HTML' });
+                let msg = `*${ticket.id}* | ${ticket.type} | الأولوية: ${ticket.priority}\n`;
+                msg += `من: ${ticket.user_name} (${ticket.user_id}) ${ticket.user_username}\n`;
+                msg += `الحالة: *${ticket.status.toUpperCase()}*\n`;
+                msg += `المحتوى:\n${ticket.content}\n\n`;
+                if (ticket.media) msg += `_مرفق: ${ticket.media.file_type}_\n`;
+                if (ticket.admin_notes && ticket.admin_notes.length > 0) {
+                     msg += `*ملاحظات الإدارة:*\n`;
+                     ticket.admin_notes.forEach(n => msg += `• [${n.time.substring(5, 16)}] by ${n.admin_id}: ${n.note.substring(0, 50)}...\n`);
+                }
+                
+                await ctx.replyWithMarkdown(msg);
                 return;
             }
-
+            
             if (action === 'ticket_reply') {
-                return ctx.reply(`أرسل ردك الآن باستخدام الأمر:\n/reply ${ticketId} [نص الرسالة]`);
+                return ctx.reply(`أرسل ردك الآن باستخدام الأمر، *مع الإقتباس* من رسالة التذكرة:\n\n/reply [نص الرسالة]`);
             }
-
+            
             if (action === 'ticket_close') {
                 TICKETS[ticketIndex].status = 'closed (Admin)';
+                TICKETS[ticketIndex].history.push({time: new Date().toISOString(), action: 'closed', by: `admin:${ctx.from.id}`});
                 saveJSON(TICKETS_FILE, TICKETS);
-                await ctx.editMessageText(`✅ تم إغلاق التذكرة ${esc(ticketId)} إدارياً.`, { parse_mode: 'HTML' });
+                await ctx.editMessageText(`✅ تم إغلاق التذكرة *${ticketId}* إدارياً.`, { parse_mode: 'Markdown' });
                 return;
             }
-
+            
             if (action === 'ticket_delete') {
                 TICKETS.splice(ticketIndex, 1);
                 saveJSON(TICKETS_FILE, TICKETS);
-                await ctx.editMessageText(`🗑️ تم حذف التذكرة ${esc(ticketId)} للتجريب.`, { parse_mode: 'HTML' });
+                await ctx.editMessageText(`🗑️ تم حذف التذكرة *${ticketId}* للتجريب.`, { parse_mode: 'Markdown' });
                 return;
             }
+            
+            if (action === 'qr_exec') {
+                 const qrKey = parts[2];
+                 if (!CONFIG.QUICK_REPLIES[qrKey]) return ctx.reply(`خطأ: مفتاح الرد السريع غير موجود.`);
+                 
+                 const replyText = CONFIG.QUICK_REPLIES[qrKey];
+                 // Simulate /reply execution
+                 const replyCommandText = `/reply ${ticketId} ${replyText}`;
+                 const replyCtx = { ...ctx, message: { ...ctx.message, text: replyCommandText, entities: [] } };
+                 
+                 // Directly call the handler logic (this is safe inside the same file)
+                 await replyCommandLogic(replyCtx, ticketId, replyText);
+                 
+                 // Update the inline keyboard to reflect action (optional)
+                 try {
+                     await ctx.editMessageText(`✅ تم تنفيذ الرد السريع [${qrKey.toUpperCase()}] على التذكرة *${ticketId}*.`, { parse_mode: 'Markdown' });
+                 } catch(e) { /* ignore edit error */ }
+                 return;
+            }
         }
-
+        
         // --- Client Confirmation Actions ---
         if (action.startsWith('confirm_close_')) {
             const ticketIndex = TICKETS.findIndex(t => t.id === ticketId);
@@ -373,159 +424,213 @@ BOT.on('callback_query', async (ctx) => {
 
             if (action === 'confirm_close_yes') {
                 TICKETS[ticketIndex].status = 'closed (Client Confirmed)';
+                TICKETS[ticketIndex].history.push({time: new Date().toISOString(), action: 'confirmed solved', by: 'client'});
                 saveJSON(TICKETS_FILE, TICKETS);
-                await ctx.editMessageText(`✅ شكراً لك! تم إغلاق تذكرتك ${esc(ticketId)} بنجاح.`, { parse_mode: 'HTML' });
+                await ctx.editMessageText(`✅ شكراً لك! تم إغلاق تذكرتك *${ticketId}* بنجاح.`, { parse_mode: 'Markdown' });
                 return;
             }
-
+            
             if (action === 'confirm_close_no') {
                 TICKETS[ticketIndex].status = 'open (Reopened by Client)';
+                TICKETS[ticketIndex].history.push({time: new Date().toISOString(), action: 'reopened', by: 'client'});
                 saveJSON(TICKETS_FILE, TICKETS);
-                await ctx.editMessageText(`⚠️ تم إعادة فتح التذكرة ${esc(ticketId)}. سيتم تحويل طلبك لمدير الدعم للمتابعة.`, { parse_mode: 'HTML' });
-                try {
-                  await BOT.telegram.sendMessage(ADMIN_CHAT_ID, `⚠️ التذكرة ${esc(ticketId)} أعيد فتحها بواسطة العميل.`, { parse_mode: 'HTML' });
-                } catch(e){}
+                await ctx.editMessageText(`⚠️ تم إعادة فتح التذكرة *${ticketId}*. سيتم تحويل طلبك لمدير الدعم للمتابعة.`, { parse_mode: 'Markdown' });
+                // Notify admin again
+                try { await BOT.telegram.sendMessage(ADMIN_CHAT_IDS[0], `⚠️ التذكرة *${ticketId}* أعيد فتحها بواسطة العميل.`, { parse_mode: 'Markdown' }); } catch(e){}
                 return;
             }
         }
-
+        
     } catch (e) {
         console.error('on callback query error', e);
     }
 });
 
 // --- Admin-only commands ---
-function isAdmin(id) {
-    return ADMIN_CHAT_ID && Number(id) === ADMIN_CHAT_ID;
+
+// Reusable logic for /reply and QR execution
+async function replyCommandLogic(ctx, id, replyText) {
+    const tIdx = TICKETS.findIndex(x=>x.id===id);
+    
+    if(tIdx === -1) return ctx.reply('التذكرة غير موجودة.');
+    
+    const ticket = TICKETS[tIdx];
+    try {
+        // Send reply to user
+        const replyMsg = `🔔 تحديث تذكرتك *${ticket.id}* (تم الرد):\n\n${replyText}`;
+        await BOT.telegram.sendMessage(ticket.user_id, replyMsg, { 
+            parse_mode: 'Markdown',
+            ...TEXTS.CLIENT_CONFIRM_KB(ticket.id) // Send confirmation buttons
+        });
+        
+        // Update ticket status and notes
+        TICKETS[tIdx].status = 'awaiting client confirmation';
+        TICKETS[tIdx].admin_notes.push({ time: new Date().toISOString(), admin_id: ctx.from.id, reply: replyText }); // Storing reply as a note
+        TICKETS[tIdx].history.push({time: new Date().toISOString(), action: 'replied', by: `admin:${ctx.from.id}`});
+        saveJSON(TICKETS_FILE, TICKETS);
+        
+        await ctx.reply(`✅ تم إرسال الرد بنجاح للعميل (التذكرة: ${id}). تم تحويل الحالة إلى انتظار تأكيد العميل.`);
+    } catch (e) {
+        console.error('Reply command error:', e);
+        await ctx.reply('❌ فشل في إرسال الرد للعميل. ربما قام بحظر البوت.');
+    }
 }
+
+// /reply <text> (with quote) - admin: reply and send client confirmation
+BOT.command('reply', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied. Admin only command.');
+    
+    const text = ctx.message.text.trim();
+    const parts = text.split(' ').filter(Boolean);
+    
+    let id = parts[1]; // Expected ID if not quoting
+    let replyText = parts.slice(2).join(' '); // Expected text if not quoting
+
+    // --- Logic for quoting a ticket message ---
+    if (ctx.message.reply_to_message) {
+         const noticeRegex = /🔔 تذكرة جديدة:\s*\*([A-Z0-9-]+)\*/;
+         const match = ctx.message.reply_to_message.text ? ctx.message.reply_to_message.text.match(noticeRegex) : null;
+         
+         if (match) {
+             id = match[1]; // Found ID from the quoted message
+             replyText = parts.slice(1).join(' '); // Reply text is all parts after /reply
+         }
+    }
+    
+    // Final check for parameters
+    if (!id || !replyText) {
+        return ctx.reply('الاستخدام: /reply <TICKET_ID> <رسالة الرد> أو /reply <رسالة الرد> مع الإقتباس من رسالة التذكرة.');
+    }
+    
+    id = id.trim().toUpperCase();
+    
+    return replyCommandLogic(ctx, id, replyText);
+});
+
+
+// /qr <id> <qr_key> - Admin quick reply command (Simplified, mainly for backup)
+BOT.command('qr', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied. Admin only command.');
+    
+    const parts = ctx.message.text.split(' ').filter(Boolean);
+    if (parts.length < 3) return ctx.reply('الاستخدام: /qr <TICKET_ID> <QR_KEY>.\nالمفاتيح المتاحة: ' + Object.keys(CONFIG.QUICK_REPLIES).join(', '));
+    
+    const id = parts[1].trim().toUpperCase();
+    const qrKey = parts[2].trim().toLowerCase();
+    
+    if (!CONFIG.QUICK_REPLIES[qrKey]) return ctx.reply(`مفتاح الرد السريع (*${qrKey}*) غير موجود في الإعدادات.`);
+    
+    const replyText = CONFIG.QUICK_REPLIES[qrKey];
+    
+    return replyCommandLogic(ctx, id, replyText);
+});
+
 
 // /tickets - admin only: list open tickets
 BOT.command('tickets', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied.');
     const open = TICKETS.filter(t => t.status.includes('open') || t.status.includes('review') || t.status.includes('awaiting')).slice(0, 20);
     if (open.length === 0) return ctx.reply('لا توجد تذاكر مفتوحة حالياً.');
-
-    let msg = '<b>التذاكر المفتوحة (آخر 20):</b>\n';
-    open.forEach(t=> msg += `\n${esc(t.id)} (${esc(t.priority)}) | ${esc(t.type)} | ${esc(t.user_name)} | ${esc(t.time.substring(5,16))}\n`);
-    await ctx.reply(msg, { parse_mode: 'HTML' });
+    
+    let msg = '*التذاكر المفتوحة (آخر 20):*\n';
+    open.forEach(t=> msg += `\n${t.id} (${t.priority}) | ${t.type} | ${t.user_name} | ${t.status}\n`);
+    await ctx.replyWithMarkdown(msg);
 });
 
-// /reply <id> <text> admin: reply and send client confirmation
-BOT.command('reply', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied. Admin only command.');
+// /search <query> - admin: search in ticket content
+BOT.command('search', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied.');
+    
+    const query = ctx.message.text.split(' ').slice(1).join(' ').trim();
+    if (!query) return ctx.reply('الاستخدام: /search <نص_للبحث_عنه_في_محتوى_التذكرة>');
 
+    const results = TICKETS.filter(t => t.content.toLowerCase().includes(query.toLowerCase())).slice(0, 10);
+    
+    if (results.length === 0) return ctx.reply(`لم يتم العثور على تذاكر تحتوي على: "${query}"`);
+
+    let msg = `*نتائج البحث لـ "${query}" (أول 10):*\n`;
+    results.forEach(t=> msg += `\n${t.id} (${t.priority}) | ${t.status} | ${t.user_name}\n`);
+    await ctx.replyWithMarkdown(msg);
+});
+
+// /userhistory <USER_ID or @username> - admin: view all tickets for a user
+BOT.command('userhistory', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied.');
+    
+    const target = ctx.message.text.split(' ')[1];
+    if (!target) return ctx.reply('الاستخدام: /userhistory <USER_ID> أو <@username>');
+
+    let targetId;
+    if (target.startsWith('@')) {
+        const userTicket = TICKETS.find(t => t.user_username.toLowerCase() === target.toLowerCase());
+        if (!userTicket) return ctx.reply(`لم يتم العثور على سجل مستخدم بالـ Username: ${target}`);
+        targetId = userTicket.user_id;
+    } else if (!isNaN(Number(target))) {
+        targetId = Number(target);
+    } else {
+        return ctx.reply('معرف المستخدم غير صحيح. يجب أن يكون ID رقمي أو Username يبدأ بـ @');
+    }
+
+    const userTickets = TICKETS.filter(t => t.user_id === targetId).slice(0, 20);
+    if (userTickets.length === 0) return ctx.reply(`لم يتم العثور على تذاكر للمستخدم ID: ${targetId}`);
+
+    let msg = `*سجل تذاكر المستخدم ${target} (أول 20):*\n`;
+    userTickets.forEach(t=> msg += `\n${t.id} (${t.priority}) | ${t.status} | ${t.time.substring(0, 10)}\n`);
+    await ctx.replyWithMarkdown(msg);
+});
+
+// /setstatus <ID> <status> - admin: manually change ticket status
+BOT.command('setstatus', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied.');
+    
     const parts = ctx.message.text.split(' ').filter(Boolean);
-    if (parts.length < 3) return ctx.reply('الاستخدام: /reply <TICKET_ID> <رسالة الرد>');
-
+    if (parts.length < 3) return ctx.reply('الاستخدام: /setstatus <TICKET_ID> <حالة_جديدة>');
+    
     const id = parts[1].trim().toUpperCase();
-    const replyText = parts.slice(2).join(' ');
+    const newStatus = parts.slice(2).join(' ');
     const tIdx = TICKETS.findIndex(x=>x.id===id);
-
+    
     if(tIdx === -1) return ctx.reply('التذكرة غير موجودة.');
-
-    const ticket = TICKETS[tIdx];
-    try {
-        // Send reply to user
-        const replyMsg = `🔔 تحديث تذكرتك <b>${esc(ticket.id)}</b> (تم الرد):\n\n<pre>${esc(replyText)}</pre>`;
-        await BOT.telegram.sendMessage(ticket.user_id, replyMsg, {
-            parse_mode: 'HTML',
-            reply_markup: TEXTS.CLIENT_CONFIRM_KB(ticket.id).reply_markup
-        });
-
-        // Update ticket status and notes
-        TICKETS[tIdx].status = 'awaiting client confirmation';
-        TICKETS[tIdx].admin_notes.push({ time: new Date().toISOString(), admin_id: ctx.from.id, reply: replyText });
-        saveJSON(TICKETS_FILE, TICKETS);
-
-        await ctx.reply(`✅ تم إرسال الرد بنجاح للعميل (التذكرة: ${id}). تم تحويل الحالة إلى انتظار تأكيد العميل.`);
-    } catch (e) {
-        console.error('Reply command error:', e);
-        await ctx.reply('❌ فشل في إرسال الرد للعميل. ربما قام بحظر البوت.');
-    }
+    
+    TICKETS[tIdx].status = newStatus;
+    TICKETS[tIdx].history.push({time: new Date().toISOString(), action: `status changed to: ${newStatus}`, by: `admin:${ctx.from.id}`});
+    saveJSON(TICKETS_FILE, TICKETS);
+    
+    await ctx.reply(`✅ تم تحديث حالة التذكرة *${id}* إلى: *${newStatus}*.`, { parse_mode: 'Markdown' });
 });
 
-// /qr <id> <qr_key> - Admin quick reply command
-BOT.command('qr', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied. Admin only command.');
-
+// /note <ID> <text> - admin: add internal note
+BOT.command('note', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied.');
+    
     const parts = ctx.message.text.split(' ').filter(Boolean);
-    if (parts.length < 3) return ctx.reply('الاستخدام: /qr <TICKET_ID> <QR_KEY>.\nالمفاتيح المتاحة: ' + Object.keys(CONFIG.QUICK_REPLIES).join(', '));
-
+    if (parts.length < 3) return ctx.reply('الاستخدام: /note <TICKET_ID> <نص الملاحظة>');
+    
     const id = parts[1].trim().toUpperCase();
-    const qrKey = parts[2].trim().toLowerCase();
-
-    if (!CONFIG.QUICK_REPLIES[qrKey]) return ctx.reply(`مفتاح الرد السريع (${esc(qrKey)}) غير موجود في الإعدادات.`);
-
-    const replyText = CONFIG.QUICK_REPLIES[qrKey];
-
-    // Execute reply directly
-    // reuse same logic as /reply command to send message and update ticket
+    const noteText = parts.slice(2).join(' ');
     const tIdx = TICKETS.findIndex(x=>x.id===id);
-    if (tIdx === -1) return ctx.reply('التذكرة غير موجودة.');
-
-    const ticket = TICKETS[tIdx];
-    try {
-      const replyMsg = `🔔 تحديث تذكرتك <b>${esc(ticket.id)}</b> (رد سريع):\n\n<pre>${esc(replyText)}</pre>`;
-      await BOT.telegram.sendMessage(ticket.user_id, replyMsg, {
-        parse_mode: 'HTML',
-        reply_markup: TEXTS.CLIENT_CONFIRM_KB(ticket.id).reply_markup
-      });
-
-      TICKETS[tIdx].status = 'awaiting client confirmation';
-      TICKETS[tIdx].admin_notes.push({ time: new Date().toISOString(), admin_id: ctx.from.id, reply: replyText });
-      saveJSON(TICKETS_FILE, TICKETS);
-
-      await ctx.reply(`✅ تم إرسال الرد السريع للتذكرة ${id}.`);
-    } catch (e) {
-      console.error('QR reply error', e);
-      await ctx.reply('❌ فشل في إرسال الرد السريع.');
-    }
+    
+    if(tIdx === -1) return ctx.reply('التذكرة غير موجودة.');
+    
+    if (!TICKETS[tIdx].admin_notes) TICKETS[tIdx].admin_notes = [];
+    TICKETS[tIdx].admin_notes.push({ time: new Date().toISOString(), admin_id: ctx.from.id, note: noteText });
+    TICKETS[tIdx].history.push({time: new Date().toISOString(), action: 'internal note added', by: `admin:${ctx.from.id}`});
+    saveJSON(TICKETS_FILE, TICKETS);
+    
+    await ctx.reply(`✅ تم إضافة الملاحظة الداخلية بنجاح إلى التذكرة *${id}*.`, { parse_mode: 'Markdown' });
 });
 
-// --- Webhook / Server setup for Render (Web Service) ---
-const app = express();
-const PORT = process.env.PORT || 3000;
-const tokenPrefix = CONFIG.BOT_TOKEN.split(':')[0];
-const WEBHOOK_PATH = `/webhook/${tokenPrefix}`; // e.g. /webhook/8412410...
-const EXTERNAL_URL = (process.env.WEBHOOK_URL || CONFIG.WEBHOOK_URL || '').replace(/\/$/, ''); // optional
 
-// Attach telegraf middleware to express
-app.use(express.json());
-app.use(BOT.webhookCallback(WEBHOOK_PATH));
-
-// health check
-app.get('/', (req, res) => res.send('OK'));
-
-// Start the server
-const server = app.listen(PORT, async () => {
-  console.log(`Server listening on port ${PORT}`);
-  botLog(`Server started on port ${PORT}`);
-
-  if (EXTERNAL_URL) {
-    const fullWebhook = `${EXTERNAL_URL}${WEBHOOK_PATH}`;
-    try {
-      await BOT.telegram.setWebhook(fullWebhook);
-      console.log('Webhook set to:', fullWebhook);
-      botLog(`Webhook set to ${fullWebhook}`);
-    } catch (e) {
-      console.error('Failed to set webhook:', e);
-    }
-  } else {
-    console.warn('No WEBHOOK_URL provided. Set CONFIG.WEBHOOK_URL or WEBHOOK_URL env var to enable Telegram webhook registration.');
-    console.warn(`Webhook endpoint (local path): ${WEBHOOK_PATH}`);
-  }
+// --- Start Bot ---
+BOT.launch().then(()=>{
+  console.log('Flash Protocol Support Bot started (Node.js/Telegraf)');
+  botLog('Bot launched successfully');
+}).catch(e => {
+    console.error('FATAL ERROR during bot launch:', e);
 });
 
 // graceful stop
-process.once('SIGINT', () => {
-  server.close(() => {
-    BOT.stop('SIGINT');
-    process.exit(0);
-  });
-});
-process.once('SIGTERM', () => {
-  server.close(() => {
-    BOT.stop('SIGTERM');
-    process.exit(0);
-  });
-});
+process.once('SIGINT', () => BOT.stop('SIGINT'));
+process.once('SIGTERM', () => BOT.stop('SIGTERM'));
+
+// Note: Removed the unused BOT.executeCommand utility as logic is now direct/internal.
