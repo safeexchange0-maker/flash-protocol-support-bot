@@ -1,0 +1,12 @@
+{
+  "name": "flash-protocol-support-bot",
+  "version": "1.0.0",
+  "description": "Telegram support bot (formal technical tone) for Flash Protocol demo UI.",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.12.2"
+  }
+}
