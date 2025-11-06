@@ -15,9 +15,14 @@ if (!CONFIG.BOT_TOKEN || CONFIG.BOT_TOKEN === 'YOUR_BOT_TOKEN') {
   console.error('Please set BOT_TOKEN in config.json');
   process.exit(1);
 }
+
 const BOT = new Telegraf(CONFIG.BOT_TOKEN);
-// Note: We are sticking to a single ADMIN_CHAT_ID for simplicity as per your config.json
 const ADMIN_CHAT_ID = Number(CONFIG.ADMIN_CHAT_ID);
+
+// --- 🛠️ Global Admin State ---
+// يستخدم لتخزين التذكرة التي ينتظر البوت رداً عليها من الأدمن
+// { adminId: ticketId_to_reply_to }
+let ADMIN_STATE = {};
 
 // --- Simple File-based DB Setup ---
 const DB_DIR = path.resolve(__dirname, 'data');
@@ -42,7 +47,6 @@ let TICKETS = loadJSON(TICKETS_FILE, []);
 let LOGS = loadJSON(LOG_FILE, []);
 
 // --- Data & Helpers ---
-// Using keys from the uploaded file
 const PURCHASE_KEYS = [
   "FP12-L1-15K-W01","FP12-L2-100K-W03","FP12-L3-250K-W05","FP12-L4-400K-W06",
   "FP12-L5-500K-W09","FP12-TEST-100-W15","FP12-R-200K-W17","FP12-INS-750K-W21",
@@ -90,12 +94,41 @@ function getUserInfo(ctx) {
     };
 }
 
-// Admin Check Helper
 function isAdmin(id) {
     return ADMIN_CHAT_ID && Number(id) === ADMIN_CHAT_ID;
 }
 
-// --- UI Texts & Keyboards (unchanged) ---
+// --- 💡 Reply Logic: Centralized function for replying to a ticket (Used by Reply State, /reply, /qr) ---
+async function sendAdminReply(ctx, ticketId, replyText) {
+    const tIdx = TICKETS.findIndex(x=>x.id===ticketId);
+    if(tIdx === -1) return ctx.reply('التذكرة غير موجودة.');
+    
+    const ticket = TICKETS[tIdx];
+    try {
+        // 1. Send reply to user (Client)
+        const replyMsg = `🔔 تحديث تذكرتك *${ticket.id}* (تم الرد):\n\n${replyText}`;
+        await BOT.telegram.sendMessage(ticket.user_id, replyMsg, { 
+            parse_mode: 'Markdown',
+            ...TEXTS.CLIENT_CONFIRM_KB(ticket.id) // Send confirmation buttons
+        });
+        
+        // 2. Update ticket status and notes (DB)
+        TICKETS[tIdx].status = 'awaiting client confirmation';
+        TICKETS[tIdx].admin_notes.push({ time: new Date().toISOString(), admin_id: ctx.from.id, reply: replyText });
+        saveJSON(TICKETS_FILE, TICKETS);
+        
+        // 3. Send confirmation to Admin
+        await ctx.reply(`✅ تم إرسال الرد بنجاح للعميل (التذكرة: ${ticketId}). تم تحويل الحالة إلى انتظار تأكيد العميل.`);
+        return true;
+    } catch (e) {
+        console.error('Reply send error:', e);
+        await ctx.reply('❌ فشل في إرسال الرد للعميل. ربما قام بحظر البوت.');
+        return false;
+    }
+}
+
+
+// --- UI Texts & Keyboards ---
 const TEXTS = {
   START: `📡 Flash Protocol Support Hub\n\nأهلاً بك.\nتستطيع إرسال:\n• كود المفتاح (Key)\n• أو عنوان المحفظة (TRC20)\n• أو وصف للمشكلة الآن.\n\nاختر:`,
 
@@ -107,44 +140,30 @@ const TEXTS = {
   ACK_RECEIVED: (ticketId, priority) => `✅ تم استلام طلبك. رقم التذكرة: *${ticketId}*\nالأولوية: *${priority}*\n\nحالة التذكرة: _قيد المراجعة_.\nيمكنك متابعة حالتها عبر الأمر: \`/status ${ticketId}\``,
 
   KEY_VALID: (key) => `🔒 فحص المفتاح: *${key}*\n\n✅ النتيجة: المفتاح معروف وصالح حسب قاعدة البيانات المحلية.`,
-  KEY_UNKNOWN: (key) => `🔒 فحص المفتاح: *${key}*\n\n⚠️ النتيجة: لم يتم العثور على هذا الكود في النظام المحلي. سيتم حفظ التذكرة لمراجعة الفريق.`,
   WALLET_VALID: (addr) => `🔗 فحص المحفظة: \`${addr}\`\n\n✅ النتيجة: عنوان TRC20 يبدو صحيحاً وصالحاً لربط العرض المبدئي.`,
-  WALLET_INVALID: (addr) => `🔗 فحص المحفظة: \`${addr}\`\n\n⚠️ النتيجة: تنسيق العنوان غير صحيح. تأكد أن العنوان يبدأ بحرف T وطوله صحيح.`,
   HELP: `⚙️ أوامر مفيدة:\n/start - بداية المحادثة\n/help - تعليمات\n/status <TICKET_ID> - عرض حالة تذكرتك\n`,
   SUPPORT_PROMPT: `📝 من فضلك اكتب وصف المشكلة هنا. اذكر أكبر قدر ممكن من التفاصيل (المفتاح إن وجد، محفظة، TXID، صور...).`,
   
   ADMIN_NOTICE: (ticket) => `🔔 تذكرة جديدة: *${ticket.id}* (الأولوية: ${ticket.priority})\nمن: ${ticket.user_name} (${ticket.user_id}) ${ticket.user_username}\nنوع: ${ticket.type}\nمحتوى:\n${ticket.content}`,
   
-  ADMIN_KB: (ticketId) => {
-      const qrButtons = Object.keys(CONFIG.QUICK_REPLIES || {}).map(key => 
-          Markup.button.callback(`[${key.toUpperCase()}]`, `qr_exec:${ticketId}:${key}`)
-      );
-      return Markup.inlineKeyboard([
-          [
-            Markup.button.callback('✅ إغلاق التذكرة', `ticket_close:${ticketId}`),
-            Markup.button.callback('↩️ الرد على التذكرة', `ticket_reply:${ticketId}`) 
-          ],
-          qrButtons.slice(0, 3), 
-          [
-            Markup.button.callback('⚙️ عرض التفاصيل', `ticket_view:${ticketId}`),
-            Markup.button.callback('🗑️ حذف التذكرة (للتجريب)', `ticket_delete:${ticketId}`)
-          ]
-      ]);
-  },
+  ADMIN_KB: (ticketId) => Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✅ إغلاق التذكرة', `ticket_close:${ticketId}`),
+      Markup.button.callback('↩️ الرد على التذكرة', `ticket_reply:${ticketId}`) // هذا الزر يفعّل الـ ADMIN_STATE
+    ],
+    [
+      Markup.button.callback('⚙️ عرض التفاصيل', `ticket_view:${ticketId}`),
+      Markup.button.callback('🗑️ حذف التذكرة (للتجريب)', `ticket_delete:${ticketId}`)
+    ]
+  ]),
   
   CLIENT_CONFIRM_KB: (ticketId) => Markup.inlineKeyboard([
       Markup.button.callback('✅ نعم، تم حلها', `confirm_close_yes:${ticketId}`),
       Markup.button.callback('❌ لا، المشكلة مستمرة', `confirm_close_no:${ticketId}`)
-  ]),
-  
-  // New: Confirmation Keyboard for Admin's quote reply
-  ADMIN_REPLY_CONFIRM: (ticketId) => Markup.inlineKeyboard([
-      [Markup.button.callback('✅ إرسال الرد للعميل', `send_reply:${ticketId}`)],
-      [Markup.button.callback('❌ إلغاء الرد', `cancel_reply:${ticketId}`)]
-  ]),
+  ])
 };
 
-// --- Ticket Creation Helper (unchanged) ---
+// --- Ticket Creation Helper ---
 async function createTicket(ctx, type, content, media = null) {
     const userInfo = getUserInfo(ctx);
     const priority = determinePriority(content);
@@ -214,87 +233,33 @@ BOT.start(async (ctx) => {
 
 BOT.help((ctx) => ctx.reply(TEXTS.HELP));
 
-// /status (unchanged)
-BOT.command('status', async (ctx) => {
-    const parts = ctx.message.text.split(' ').filter(Boolean);
-    if (parts.length < 2) return ctx.reply('الاستخدام: /status <TICKET_ID>');
-    const id = parts[1].trim().toUpperCase();
 
-    // Allow Admin to view any ticket status, client only their own
-    const t = isAdmin(ctx.from.id) 
-        ? TICKETS.find(x => x.id === id)
-        : TICKETS.find(x => x.id === id && Number(x.user_id) === Number(ctx.from.id));
-        
-    if (!t) return ctx.reply('عذراً، لم يتم العثور على تذكرة بهذا الرقم.');
-
-    let msg = `*حالة التذكرة: ${t.id}*\n`;
-    // If admin, show client details
-    if (isAdmin(ctx.from.id)) {
-        msg += `العميل: ${t.user_name} (${t.user_id})\n`;
-    }
-    msg += `الأولوية: ${t.priority}\n`;
-    msg += `الحالة: *${t.status.toUpperCase()}*\n`;
-    msg += `تم إنشاؤها في: ${t.time.substring(0, 10)}\n`;
-    msg += `المحتوى: _${t.content.substring(0, 100)}..._\n\n`;
-
-    // Display basic history/notes (simplified)
-    if (t.status === 'closed' && t.admin_notes && t.admin_notes.length > 0) {
-        msg += `آخر رد من الإدارة:\n_${t.admin_notes[t.admin_notes.length - 1].reply.substring(0, 150)}..._`;
-    } else if (t.status.includes('open') || t.status.includes('review') || t.status.includes('awaiting')) {
-        msg += 'التذكرة قيد المراجعة، سيتم الرد عليك قريباً.';
-    }
-
-    await ctx.replyWithMarkdown(msg);
-});
-
-// --- 2. Generic Text Handler (MODIFIED) ---
+// --- 1. Generic Text Handler (Ticket Creation / Quick Checks / ADMIN REPLY) ---
 BOT.on('text', async (ctx) => {
     try {
         const text = (ctx.message.text || '').trim();
-        const replyToMessage = ctx.message.reply_to_message;
-        
-        // -----------------------------------------------------
-        // --- 1. ADMIN ONLY: Handle Ad-Hoc Reply by Quoting ---
-        // -----------------------------------------------------
-        if (isAdmin(ctx.from.id)) {
-            const noticeRegex = /🔔 تذكرة جديدة:\s*\*([A-Z0-9-]+)\*/;
-            // Check if admin is replying to an official ticket notification
-            const match = replyToMessage && replyToMessage.text ? replyToMessage.text.match(noticeRegex) : null;
+        const adminId = ctx.from.id;
+
+        // [ FIX: 1 - ADMIN REPLY STATE ] 
+        // إذا كان الأدمن في حالة انتظار رد، استخدم النص الحالي كـ رد على التذكرة.
+        if (isAdmin(adminId) && ADMIN_STATE[adminId]) {
+            const ticketId = ADMIN_STATE[adminId];
+            delete ADMIN_STATE[adminId]; // إزالة حالة الانتظار
             
-            if (match) {
-                const ticketId = match[1];
-                
-                // If the message is an explicit command (e.g., /reply, /tickets), let the command handler take over
-                if (text.startsWith('/')) {
-                    return; 
-                }
-                
-                // Treat any plain text reply as an intended response
-                await ctx.reply(`هل تريد إرسال الرد التالي للعميل (${ticketId}):\n\n*${text}*`, { 
-                    parse_mode: 'Markdown', 
-                    ...TEXTS.ADMIN_REPLY_CONFIRM(ticketId) 
-                });
-                
-                // Store the reply temporarily in the ticket object for confirmation
-                const t = TICKETS.find(x => x.id === ticketId);
-                if (t) {
-                    t.temp_reply_text = text;
-                    saveJSON(TICKETS_FILE, TICKETS);
-                }
-                return; // Stop processing further
-            }
-            
-            // If admin is not quoting a ticket notice, and not using a command, IGNORE the message.
-            if (!text.startsWith('/')) {
-                return; 
-            }
-            // If it's a command, let the command handlers (like /reply, /tickets) take over.
-            return; 
+            // تنفيذ وظيفة الرد المركزية
+            await sendAdminReply(ctx, ticketId, text);
+            return;
         }
 
-        // -----------------------------------------------------
-        // --- 2. CLIENT Logic (Normal Ticket Creation) ---
-        // -----------------------------------------------------
+        // [ FIX: 2 - ADMIN GUARDRAIL ] 
+        // تجاهل أي رسالة نصية عادية من الأدمن لا تبدأ بأمر (/)
+        if (isAdmin(adminId)) {
+             if (text.startsWith('/')) return; // السماح للأوامر الإدارية بالمرور
+             return; // تجاهل أي نص عادي من الأدمن لمنع إنشاء تذاكر جديدة
+        }
+
+
+        // --- Client Logic Starts Here ---
 
         // Check for quick keyboard commands
         if (text === '🔑 إرسال كود مفتاح') return ctx.reply('أرسل كود المفتاح هنا (مثال: FP12-L3-250K-W05)');
@@ -303,30 +268,25 @@ BOT.on('text', async (ctx) => {
         
         // FAQ
         if (text === '📕 الأسئلة الشائعة') {
-             const faqData = CONFIG.FAQ_DATA && CONFIG.FAQ_DATA.main;
-             if(faqData && faqData.buttons) {
-                 return ctx.reply(faqData.text, Markup.inlineKeyboard(faqData.buttons.map(b => [b])));
+             if(CONFIG.FAQ_DATA && CONFIG.FAQ_DATA.main && CONFIG.FAQ_DATA.main.buttons) {
+                 return ctx.reply(CONFIG.FAQ_DATA.main.text, Markup.inlineKeyboard(CONFIG.FAQ_DATA.main.buttons.map(b => [b])));
              }
              return ctx.reply('عذراً، بيانات الأسئلة الشائعة غير متاحة حالياً.');
         }
         
-        // Key/Wallet Automatic Check and Ticket
+        // --- Key/Wallet Automatic Check and Ticket ---
         const maybeKey = text.toUpperCase();
         if (isKnownKey(maybeKey)) {
             await ctx.replyWithMarkdown(TEXTS.KEY_VALID(maybeKey));
             return createTicket(ctx, 'key-check', `Key check: ${maybeKey}`);
         }
         
-        if (looksLikeTRC20(text)) {
-             if (maybeKey.includes('TXID')) { 
-                 // Will fall through to support ticket below
-             } else {
-                await ctx.replyWithMarkdown(TEXTS.WALLET_VALID(text));
-                return createTicket(ctx, 'wallet-check', `Wallet check: ${text}`);
-             }
+        if (looksLikeTRC20(text) && !maybeKey.includes('TXID')) {
+            await ctx.replyWithMarkdown(TEXTS.WALLET_VALID(text));
+            return createTicket(ctx, 'wallet-check', `Wallet check: ${text}`);
         }
 
-        // Otherwise treat as generic support message -> create ticket
+        // --- Otherwise treat as generic support message -> create ticket ---
         return createTicket(ctx, 'support', text);
 
     } catch (e) {
@@ -334,13 +294,12 @@ BOT.on('text', async (ctx) => {
     }
 });
 
-
-// --- 3. Media Handlers (Photos and Documents) ---
+// --- 2. Media Handlers (Photos and Documents) ---
 BOT.on(['photo', 'document'], async (ctx) => {
-    // Stop processing if the sender is an admin
-    if (isAdmin(ctx.from.id)) return;
-    
     try {
+        // [GUARDRAIL] Ignore Admin's media messages to prevent new tickets
+        if (isAdmin(ctx.from.id)) return;
+        
         const type = ctx.message.photo ? 'photo' : 'document';
         const fileId = type === 'photo' ? ctx.message.photo.slice(-1)[0].file_id : ctx.message.document.file_id;
         const fileName = type === 'document' ? ctx.message.document.file_name : 'photo';
@@ -362,7 +321,7 @@ BOT.on(['photo', 'document'], async (ctx) => {
 });
 
 
-// --- 4. Callback Query Handler (MODIFIED for Reply Confirmation) ---
+// --- 3. Callback Query Handler (For Inline Keyboards: FAQ, Admin Actions, Client Confirmation) ---
 BOT.on('callback_query', async (ctx) => {
     try {
         const data = ctx.callbackQuery.data;
@@ -370,61 +329,41 @@ BOT.on('callback_query', async (ctx) => {
         const action = parts[0];
         const ticketId = parts[1];
         
-        await ctx.answerCbQuery(); 
+        await ctx.answerCbQuery(); // Dismiss loading icon
+
+        // --- FAQ Navigation ---
+        if (action.startsWith('faq_')) {
+            const faqKey = action;
+            const faqData = CONFIG.FAQ_DATA[faqKey];
+            if (faqData) {
+                const buttons = faqData.buttons ? faqData.buttons.map(b => [b]) : [];
+                await ctx.editMessageText(faqData.text, Markup.inlineKeyboard(buttons));
+            }
+            return;
+        }
 
         // --- Admin Actions ---
         if (isAdmin(ctx.from.id)) {
             const ticketIndex = TICKETS.findIndex(t => t.id === ticketId);
-            const ticket = ticketIndex !== -1 ? TICKETS[ticketIndex] : null;
-
-            // --- New Reply Confirmation Actions ---
-            if (action === 'send_reply') {
-                if (!ticket || !ticket.temp_reply_text) {
-                    await ctx.editMessageText('خطأ: لا يمكن العثور على نص الرد المؤقت.');
-                    return;
-                }
-                
-                const replyText = ticket.temp_reply_text;
-                delete ticket.temp_reply_text; 
-                saveJSON(TICKETS_FILE, TICKETS);
-                
-                await replyCommandLogic(ctx, ticketId, replyText); // Re-use the reply logic
-                
-                try {
-                     await ctx.editMessageText(`✅ تم إرسال الرد المؤكد (التذكرة: ${ticketId})`, { parse_mode: 'Markdown' });
-                } catch(e) { /* ignore edit error */ }
-                return;
-            }
-
-            if (action === 'cancel_reply') {
-                if (ticket) {
-                    delete ticket.temp_reply_text; 
-                    saveJSON(TICKETS_FILE, TICKETS);
-                }
-                try {
-                    await ctx.editMessageText(`❌ تم إلغاء الرد على التذكرة: ${ticketId}.`, { parse_mode: 'Markdown' });
-                } catch(e) { /* ignore edit error */ }
-                return;
-            }
-            // --- End New Reply Confirmation Actions ---
-
-            // Existing ticket actions 
-            if (!ticket) return;
+            if (ticketIndex === -1) return ctx.reply('عفواً، التذكرة غير موجودة/محذوفة.');
+            const ticket = TICKETS[ticketIndex];
 
             if (action === 'ticket_view') {
                 let msg = `*${ticket.id}* | ${ticket.type} | الأولوية: ${ticket.priority}\n`;
                 msg += `من: ${ticket.user_name} (${ticket.user_id}) ${ticket.user_username}\n`;
                 msg += `الحالة: *${ticket.status.toUpperCase()}*\n\n`;
                 msg += `المحتوى:\n${ticket.content}`;
-                if (ticket.media) msg += `\n\n_مرفق: ${ticket.media.file_type} (ID: ${ticket.media.file_id.substring(0,15)}...)_`;
+                if (ticket.media) msg += `\n\n_مرفق: ${ticket.media.file_type}_`;
                 
                 await ctx.replyWithMarkdown(msg);
                 return;
             }
             
+            // [ FIX: 3 - REPLY STATE TRIGGER ] 
+            // عند ضغط الأدمن على زر الرد، يتم تعيين حالة انتظار الرد
             if (action === 'ticket_reply') {
-                // Inform admin to quote and reply with text
-                return ctx.reply(`أرسل ردك الآن *بالإقتباس* من رسالة التذكرة (بدون أمر /reply) أو استخدم الأمر:\n/reply ${ticketId} [نص الرسالة]`);
+                ADMIN_STATE[ctx.from.id] = ticketId; // Set the ticket ID we are waiting for a reply on
+                return ctx.reply(`↩️ *وضع الرد على التذكرة ${ticketId}*:\nمن فضلك أرسل نص ردك الآن مباشرة.`, { parse_mode: 'Markdown' });
             }
             
             if (action === 'ticket_close') {
@@ -440,24 +379,11 @@ BOT.on('callback_query', async (ctx) => {
                 await ctx.editMessageText(`🗑️ تم حذف التذكرة *${ticketId}* للتجريب.`, { parse_mode: 'Markdown' });
                 return;
             }
-            
-            // Quick Reply Execution (QR)
-            if (action === 'qr_exec') {
-                 const qrKey = parts[2];
-                 if (!CONFIG.QUICK_REPLIES[qrKey]) return ctx.reply(`خطأ: مفتاح الرد السريع غير موجود.`);
-                 
-                 const replyText = CONFIG.QUICK_REPLIES[qrKey];
-                 await replyCommandLogic(ctx, ticketId, replyText);
-                 
-                 try {
-                     await ctx.editMessageText(`✅ تم تنفيذ الرد السريع [${qrKey.toUpperCase()}] على التذكرة *${ticketId}*.`, { parse_mode: 'Markdown' });
-                 } catch(e) { /* ignore edit error */ }
-                 return;
-            }
         }
         
-        // --- Client Confirmation Actions (unchanged) ---
+        // --- Client Confirmation Actions ---
         if (action.startsWith('confirm_close_')) {
+            // ... (Client confirmation logic remains the same)
             const ticketIndex = TICKETS.findIndex(t => t.id === ticketId);
             if (ticketIndex === -1) return ctx.reply('عفواً، التذكرة غير موجودة/محذوفة.');
 
@@ -472,7 +398,9 @@ BOT.on('callback_query', async (ctx) => {
                 TICKETS[ticketIndex].status = 'open (Reopened by Client)';
                 saveJSON(TICKETS_FILE, TICKETS);
                 await ctx.editMessageText(`⚠️ تم إعادة فتح التذكرة *${ticketId}*. سيتم تحويل طلبك لمدير الدعم للمتابعة.`, { parse_mode: 'Markdown' });
-                try { await BOT.telegram.sendMessage(ADMIN_CHAT_ID, `⚠️ التذكرة *${ticketId}* أعيد فتحها بواسطة العميل.`, { parse_mode: 'Markdown' }); } catch(e){}
+                try { 
+                    await BOT.telegram.sendMessage(ADMIN_CHAT_ID, `⚠️ التذكرة *${ticketId}* أعيد فتحها بواسطة العميل.`, { parse_mode: 'Markdown', ...TEXTS.ADMIN_KB(ticketId) }); 
+                } catch(e){}
                 return;
             }
         }
@@ -482,35 +410,45 @@ BOT.on('callback_query', async (ctx) => {
     }
 });
 
+// --- 4. Admin Command Handlers ---
 
-// Reusable logic for /reply and QR execution
-async function replyCommandLogic(ctx, id, replyText) {
-    const tIdx = TICKETS.findIndex(x=>x.id===id);
+// /tickets - admin only: list open tickets
+BOT.command('tickets', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied.');
+    const open = TICKETS.filter(t => t.status.includes('open') || t.status.includes('review') || t.status.includes('awaiting')).slice(0, 20);
+    if (open.length === 0) return ctx.reply('لا توجد تذاكر مفتوحة حالياً.');
     
-    if(tIdx === -1) return ctx.reply('التذكرة غير موجودة.');
-    
-    const ticket = TICKETS[tIdx];
-    try {
-        // Send reply to user
-        const replyMsg = `🔔 تحديث تذكرتك *${ticket.id}* (تم الرد):\n\n${replyText}`;
-        await BOT.telegram.sendMessage(ticket.user_id, replyMsg, { 
-            parse_mode: 'Markdown',
-            ...TEXTS.CLIENT_CONFIRM_KB(ticket.id) // Send confirmation buttons
-        });
-        
-        // Update ticket status and notes
-        ticket.status = 'awaiting client confirmation';
-        ticket.admin_notes.push({ time: new Date().toISOString(), admin_id: ctx.from.id, reply: replyText }); // Storing reply as a note
-        saveJSON(TICKETS_FILE, TICKETS);
-        
-        await ctx.reply(`✅ تم إرسال الرد بنجاح للعميل (التذكرة: ${id}). تم تحويل الحالة إلى انتظار تأكيد العميل.`);
-    } catch (e) {
-        console.error('Reply command error:', e);
-        await ctx.reply('❌ فشل في إرسال الرد للعميل. ربما قام بحظر البوت.');
+    let msg = '*التذاكر المفتوحة (آخر 20):*\n';
+    open.forEach(t=> msg += `\n${t.id} (${t.priority}) | ${t.type} | ${t.user_name} | ${t.time.substring(5,16)}\n`);
+    await ctx.replyWithMarkdown(msg);
+});
+
+// /status - client command: view status
+BOT.command('status', async (ctx) => {
+    const parts = ctx.message.text.split(' ').filter(Boolean);
+    if (parts.length < 2) return ctx.reply('الاستخدام: /status <TICKET_ID>');
+    const id = parts[1].trim().toUpperCase();
+
+    const t = TICKETS.find(x => x.id === id && Number(x.user_id) === Number(ctx.from.id));
+    if (!t) return ctx.reply('عذراً، لم يتم العثور على تذكرة بهذا الرقم أو أنها ليست تذكرتك.');
+
+    let msg = `*حالة التذكرة: ${t.id}*\n`;
+    msg += `الأولوية: ${t.priority}\n`;
+    msg += `الحالة: *${t.status.toUpperCase()}*\n`;
+    msg += `تم إنشاؤها في: ${t.time.substring(0, 10)}\n`;
+    msg += `المحتوى: _${t.content.substring(0, 100)}..._\n\n`;
+
+    if (t.status === 'closed' && t.admin_notes && t.admin_notes.length > 0) {
+        msg += `آخر رد من الإدارة:\n_${t.admin_notes[t.admin_notes.length - 1].reply.substring(0, 150)}..._`;
+    } else if (t.status.includes('open') || t.status.includes('review') || t.status.includes('awaiting')) {
+        msg += 'التذكرة قيد المراجعة، سيتم الرد عليك قريباً.';
     }
-}
 
-// /reply <id> <text> admin: reply and send client confirmation (Re-used for direct command)
+    await ctx.replyWithMarkdown(msg);
+});
+
+
+// /reply <id> <text> admin: Reply via command (fallback/power user option)
 BOT.command('reply', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied. Admin only command.');
     
@@ -520,11 +458,12 @@ BOT.command('reply', async (ctx) => {
     const id = parts[1].trim().toUpperCase();
     const replyText = parts.slice(2).join(' ');
     
-    return replyCommandLogic(ctx, id, replyText);
+    // استخدام الدالة المركزية
+    await sendAdminReply(ctx, id, replyText);
 });
 
 
-// /qr <id> <qr_key> - Admin quick reply command (Re-used existing logic)
+// /qr <id> <qr_key> - Admin quick reply command
 BOT.command('qr', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied. Admin only command.');
     
@@ -538,21 +477,9 @@ BOT.command('qr', async (ctx) => {
     
     const replyText = CONFIG.QUICK_REPLIES[qrKey];
     
-    return replyCommandLogic(ctx, id, replyText);
+    // استخدام الدالة المركزية
+    await sendAdminReply(ctx, id, replyText);
 });
-
-
-// /tickets - admin only: list open tickets (unchanged)
-BOT.command('tickets', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.reply('Access denied.');
-    const open = TICKETS.filter(t => t.status.includes('open') || t.status.includes('review') || t.status.includes('awaiting')).slice(0, 20);
-    if (open.length === 0) return ctx.reply('لا توجد تذاكر مفتوحة حالياً.');
-    
-    let msg = '*التذاكر المفتوحة (آخر 20):*\n';
-    open.forEach(t=> msg += `\n${t.id} (${t.priority}) | ${t.type} | ${t.user_name} | ${t.time.substring(5,16)}\n`);
-    await ctx.replyWithMarkdown(msg);
-});
-
 
 // --- Start Bot ---
 BOT.launch().then(()=>{
@@ -565,6 +492,3 @@ BOT.launch().then(()=>{
 // graceful stop
 process.once('SIGINT', () => BOT.stop('SIGINT'));
 process.once('SIGTERM', () => BOT.stop('SIGTERM'));
-
-// Utility to enable command execution from within handlers (used by /qr) - No longer needed with refactoring
-// BOT.executeCommand = ...;
